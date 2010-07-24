@@ -23,4 +23,50 @@ https://support.shotgunsoftware.com/entries/38359-reference-filter-syntax
 
 
 
+# ---------------------------------------------------------------------------------------------
+# Documentation for features added by Nvizible Visual Effects
+#
+# Added by: Hugh Macdonald (hugh.macdonald@nvizible.com)
+# ---------------------------------------------------------------------------------------------
 
+* When creating a Shotgun() object, there is now the optional argument 'image_cache'.
+  This defines a local path where images can be cached to. The folder must already
+  exist. If the folder does not exist, then a ShotgunError is thrown.
+
+New methods in the Shotgun() object:
+
+set_image_cache(cache_location, create_location = True)
+    * Can be used as alternative to passing the image_cache argument into the Shotgun()
+      initialiser. Has the added benefit of being able to create the cache folder for you.
+    * If create_location is False, and the path does not already exist, or the path was
+      unable to be created, then a ShotgunError is thrown.
+
+get_local_thumb(entity_type, entity_id)
+    * Downloads the image associated with the specified entity and puts it into the local
+      image cache.
+
+download_thumb(entity_type, entity_id, download_to)
+    * Downloads the image associated with the specific entity to a specific local folder
+
+Modified methods in the Shotgun() object:
+
+find(entity_type, filters, fields=None, order=None, filter_operator=None, limit=0, retired_only=False, local_images=False)
+    * Has a new argument called 'local_images' to define whether returned images should
+      be downloaded to the pre-specified image cache folder. If an image has already been
+      downloaded, it won't be downloaded again.
+    * the 'fields' argument supports a new format the allows the user to rename returned fields:
+      ['<fieldPath>', '<fieldPath>', {'<fieldName>': '<fieldPath>', ...}]
+      Any path defined inside the rename dict will get <fieldPath> from Shotgun, but will
+      rename it to <fieldName> before returning it from find()
+      Just passing a dict to the 'fields' argument is also acceptable.
+
+find_one(entity_type, filters, fields=None, order=None, filter_operator=None, retired_only=False, local_images=False)
+    * See documentation for find()
+
+create(entity_type, data, return_fields=None)
+    * Allows an 'image' field to be passed in as part of data, containing a local path to
+      an image. This will be uploaded and linked the the created entity.
+
+update(entity_type, entity_id, data)
+    * Allows an 'image' field to be passed in the same way as in create()
+    * Will accept a dict for entity_id which has an 'id' key, which will be used.

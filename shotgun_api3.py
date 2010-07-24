@@ -177,7 +177,12 @@ class Shotgun:
         self.convert_datetimes_to_utc = convert_datetimes_to_utc
         self.sid = None # only load this if needed
         self.http_proxy = http_proxy
+
+        if image_cache and not os.path.isdir(image_cache):
+            raise ShotgunError("Specified image cache location does not exist")
+
         self.image_cache = image_cache
+        
         
         server_options = {
             'server_url': self.api_url,
@@ -193,8 +198,9 @@ class Shotgun:
         if not os.path.isdir(cache_location):
             if create_location:
                 os.makedirs(cache_location)
-            else:
-                raise ShotgunError("Specified image cache location does not exist")
+
+        if not os.path.isdir(cache_location):
+            raise ShotgunError("Specified image cache location does not exist")
         
         self.image_cache = cache_location
         
@@ -221,6 +227,9 @@ class Shotgun:
         raise ValueError, "%s:%s " % (entity_type,entity_id)+f.read().strip()
 
     def get_local_thumb(self, entity_type, entity_id):
+        if not self.image_cache:
+            raise ShotgunError("No image cache location specified")
+            
         thumb_url = self._get_thumb_url(entity_type, entity_id)
         thumb_local = os.path.join(self.image_cache, *thumb_url.split("/")[4:])
         if not os.path.isfile(thumb_local):
@@ -235,7 +244,7 @@ class Shotgun:
         downloaded_name = entity_type + "_" + str(entity_id) + "_" + "/".join(thumb_url.split("/")[4:]).replace("/", "_")
         downloaded_path = os.path.join(download_to, downloaded_name)
         urllib.urlretrieve(thumb_url, downloaded_path)
-        return downloaded_path    
+        return downloaded_path
   
     def schema_read(self):
         resp = self._api3.schema_read()
