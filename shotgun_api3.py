@@ -32,7 +32,7 @@
 #   https://support.shotgunsoftware.com/forums/48807-developer-api-info
 # ---------------------------------------------------------------------------------------------
 
-__version__ = "3.0.1nv"
+__version__ = "3.0.1nv2"
 
 # ---------------------------------------------------------------------------------------------
 # SUMMARY
@@ -59,10 +59,14 @@ Python Shotgun API library.
 # CHANGELOG
 # ---------------------------------------------------------------------------------------------
 """
-v3.0.1nv - 2010 July 24
-  + find(): Added the ability to request for return fields to be renamed before returning them
-            Added the ability to specify a local image cache folder and request for images to be downloaded
-            Added the ability to get images from linked entities, not just the current entity
+v3.0.1nv2 - 2010 July 25
+  + find() : Fixed a bug where requesting image from linked entities would still return the main entity's
+             image.
+
+v3.0.1nv1 - 2010 July 24
+  + find() : Added the ability to request for return fields to be renamed before returning them
+             Added the ability to specify a local image cache folder and request for images to be downloaded
+             Added the ability to get images from linked entities, not just the current entity
   + create() and update() : Added the ability to path a local image path in as 'image' and have it uploaded automatically
   + update() : Can now also pass an entity dict instead of entity_id and it will use the 'id' key.
   * Warning: none of the create() and update() changes will currently work in Batch mode.
@@ -348,9 +352,21 @@ class Shotgun:
             else:
                 returnFields.append(field)
         
+        # To get images, we actually need to request the appropriate entity's IDs
+        # So get a remapping to determine which IDs need to subsequently be converted
+        # into image results.
+        # In the imageFields dict, the keys are what the resulting images shout be called,
+        # and the values are what the requested IDs are.
+        imageFields = {}
+        for field in returnFields:
+            if field == "image":
+                imageFields["image"] = "id"
+            elif field.split(".")[-1] == "image":
+        		imageFields[field] = ".".join(field.split(".")[:-1] + ["id"])
+        
         req = {
             "type": entity_type,
-            "return_fields": returnFields,
+            "return_fields": returnFields + imageFields.values(),
             "filters": filters,
             "return_only" : return_only,
             "paging": {"entities_per_page": self.records_per_page, "current_page": 1}
@@ -386,17 +402,33 @@ class Shotgun:
             else:
                 done = True
         
-        # 'image' only returns id by default. add links to the thumbnail images
-        for field in returnFields:
-            if field == "image" or field.split(".")[-1] == "image":
+        
+        for field in imageFields:
+            # If the requested image is coming from the actual entity that we've requested, then
+            # just use the master entity_type and resulting record ID to get it.
+            if field == "image":
                 for i,v in enumerate(records):
                     if records[i][field]:
                         if local_images:
                             records[i][field] = self.get_local_thumb(entity_type,records[i]['id'])
                         else:
                             records[i][field] = self._get_thumb_url(entity_type,records[i]['id'])
+            # Otherwise, get the requested entity type from the requested field path (where the path
+            # is of format "<anything>.<entity_type>.image")
+            else:
+                for i,v in enumerate(records):
+                    if records[i][field]:
+                        image_entity_type = field.split(".")[-2]
+                        if local_images:
+                            records[i][field] = self.get_local_thumb(image_entity_type,records[i][imageFields[field]])
+                        else:
+                            records[i][field] = self._get_thumb_url(image_entity_type,records[i][imageFields[field]])
                         
-        
+                        # If the ID that we've had to request wasn't explicitely included, remove it
+                        # from the results.
+                        if imageFields[field] not in returnFields:
+                            del records[i][imageFields[field]]
+
         if renameFields:
             newRecords = []
             for record in records:
