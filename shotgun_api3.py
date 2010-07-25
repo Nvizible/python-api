@@ -32,7 +32,7 @@
 #   https://support.shotgunsoftware.com/forums/48807-developer-api-info
 # ---------------------------------------------------------------------------------------------
 
-__version__ = "3.0.1nv2"
+__version__ = "3.0.1nv3"
 
 # ---------------------------------------------------------------------------------------------
 # SUMMARY
@@ -52,13 +52,15 @@ Python Shotgun API library.
  - add logging functionality
  - add scrubbing to text data sent to server to make sure it is all valid unicode
  - support removing thumbnails / files (can only create or replace them now)
- - roll changes to create() and update() added in v3.0.1nv into batch mode
 """
 
 # ---------------------------------------------------------------------------------------------
 # CHANGELOG
 # ---------------------------------------------------------------------------------------------
 """
+v3.0.1nv3 - 2010 July 25
+  + batch() : Now supports 'update' and 'create' requests with images that will be uploaded.
+
 v3.0.1nv2 - 2010 July 25
   + find() : Fixed a bug where requesting image from linked entities would still return the main entity's
              image.
@@ -464,6 +466,7 @@ class Shotgun:
             raise ShotgunError("batch() expects a list.  Instead was sent a %s"%type(requests))
         
         reqs = []
+        imageUploads = []
         
         for r in requests:
             self._required_keys("Batched request",['request_type','entity_type'],r)
@@ -481,7 +484,15 @@ class Shotgun:
                     nr["return_fields"] = r
                 
                 for f,v in r["data"].items():
-                    nr["fields"].append( { "field_name": f, "value": v } )
+                    if f == "image":
+                        # We will be using the passed in data to determine which of the created entities
+                        # will have the image associated with it. We remove the 'image' field from the
+                        # data for comparison because this won't be in the initially created entity.
+                        entity_data = copy.deepcopy(r['data'])
+                        del entity_data['image']
+                        imageUploads.append({'request_type': "create", 'entity_type': r['entity_type'], 'entity_data': entity_data, 'image': v})
+                    else:
+                        nr["fields"].append( { "field_name": f, "value": v } )
                 
                 reqs.append(nr)
             elif r["request_type"] == "update":
@@ -495,7 +506,10 @@ class Shotgun:
                 }
                 
                 for f,v in r["data"].items():
-                    nr["fields"].append( { "field_name": f, "value": v } )
+                    if f == "image":
+                        imageUploads.append({'request_type': "update", 'entity_type': r['entity_type'], 'entity_id': r['entity_id'], 'image': v})
+                    else:
+                        nr["fields"].append( { "field_name": f, "value": v } )
                 
                 reqs.append(nr)
             elif r["request_type"] == "delete":
@@ -512,7 +526,55 @@ class Shotgun:
                 raise ShotgunError("Invalid request_type for batch")
         
         resp = self._api3.batch(reqs)
+        
+        # For each image marked to be uploaded, search through the returned entities to determine
+        # which one the images should be linked to.
+        for image in imageUploads:
+            if image['request_type'] == "update":
+                for r in resp['results']:
+                    if image['entity_id'] == r['id']:
+                        self.upload_thumbnail(image['entity_type'], image['entity_id'], image['image'])
+                        r['image'] = image['image']
+                        break
+                        
+            elif image['request_type'] == "create":
+                for r in resp['results']:
+                    # If there is already an image associated with this result, then skip it. This
+                    # enables multiple otherwise identical records to be created with different
+                    # images. If we didn't do this, all otherwise identical new records would be
+                    # assigned the same image as the first one.
+                    if "image" in r:
+                        continue
+                    # isSubSet() will determine if the image associated with the image is a sub set
+                    # of the data returned by the result. We aren't checking if it's actually
+                    # identical, as the returned result will usually have extra fields added that
+                    # weren't specified in the initial call for creation.
+                    if self.isSubSet(image['entity_data'], r):
+                        self.upload_thumbnail(image['entity_type'], r['id'], image['image'])
+                        r['image'] = image['image']
+                        break
+        
         return resp["results"]
+    
+    # Checks if every element in 'sub' is also in 'master'.
+    # For dict, list, tuple, set elements, checks sub elements
+    def isSubSet(self, sub, master):
+        for k in sub:
+            if k not in master:
+                return False
+            if type(sub[k]) != type(master[k]):
+                return False
+            if type(sub[k]) == dict:
+                if not self.isSubSet(sub[k], master[k]):
+                    return False
+            elif type(sub[k]) in (list, tuple, set):
+                if not set(sub[k]).issubset(set(master[k])):
+                    return False
+            else:
+                if sub[k] != master[k]:
+                    return False
+        return True
+            
         
     def create(self, entity_type, data, return_fields=None):
         """
