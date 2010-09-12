@@ -32,7 +32,7 @@
 #   https://support.shotgunsoftware.com/forums/48807-developer-api-info
 # ---------------------------------------------------------------------------------------------
 
-__version__ = "3.0.1nv3"
+__version__ = "3.0.1"
 
 # ---------------------------------------------------------------------------------------------
 # SUMMARY
@@ -58,21 +58,6 @@ Python Shotgun API library.
 # CHANGELOG
 # ---------------------------------------------------------------------------------------------
 """
-v3.0.1nv3 - 2010 July 25
-  + batch() : Now supports 'update' and 'create' requests with images that will be uploaded.
-
-v3.0.1nv2 - 2010 July 25
-  + find() : Fixed a bug where requesting image from linked entities would still return the main entity's
-             image.
-
-v3.0.1nv1 - 2010 July 24
-  + find() : Added the ability to request for return fields to be renamed before returning them
-             Added the ability to specify a local image cache folder and request for images to be downloaded
-             Added the ability to get images from linked entities, not just the current entity
-  + create() and update() : Added the ability to path a local image path in as 'image' and have it uploaded automatically
-  + update() : Can now also pass an entity dict instead of entity_id and it will use the 'id' key.
-  * Warning: none of the create() and update() changes will currently work in Batch mode.
-
 v3.0.1 - 2010 May 10
   + find(): default sorting to ascending, if not set (instead of requiring ascending/descending)
   + upload() and upload_thumbnail(): pass auth info through
@@ -153,7 +138,6 @@ import sys
 import time
 import urllib
 import urllib2
-import copy
 from urlparse import urlparse
 
 # ---------------------------------------------------------------------------------------------
@@ -167,7 +151,7 @@ class Shotgun:
     # of results back as one array) but just how the client class communicates with the server.
     records_per_page = 500
 
-    def __init__(self, base_url, script_name, api_key, convert_datetimes_to_utc=True, http_proxy=None, image_cache=None):
+    def __init__(self, base_url, script_name, api_key, convert_datetimes_to_utc=True, http_proxy=None):
         """
         Initialize Shotgun.
         """
@@ -183,12 +167,6 @@ class Shotgun:
         self.convert_datetimes_to_utc = convert_datetimes_to_utc
         self.sid = None # only load this if needed
         self.http_proxy = http_proxy
-
-        if image_cache and not os.path.isdir(image_cache):
-            raise ShotgunError("Specified image cache location does not exist")
-
-        self.image_cache = image_cache
-        
         
         server_options = {
             'server_url': self.api_url,
@@ -199,16 +177,6 @@ class Shotgun:
         }
         
         self._api3 = ShotgunCRUD(server_options)
-    
-    def set_image_cache(self, cache_location, create_location = True):
-        if not os.path.isdir(cache_location):
-            if create_location:
-                os.makedirs(cache_location)
-
-        if not os.path.isdir(cache_location):
-            raise ShotgunError("Specified image cache location does not exist")
-        
-        self.image_cache = cache_location
         
     def _get_thumb_url(self, entity_type, entity_id):
         """
@@ -231,27 +199,7 @@ class Shotgun:
                 break                        
         # if it's an error, message is printed on second line
         raise ValueError, "%s:%s " % (entity_type,entity_id)+f.read().strip()
-
-    def get_local_thumb(self, entity_type, entity_id):
-        if not self.image_cache:
-            raise ShotgunError("No image cache location specified")
-            
-        thumb_url = self._get_thumb_url(entity_type, entity_id)
-        thumb_local = os.path.join(self.image_cache, *thumb_url.split("/")[4:])
-        if not os.path.isfile(thumb_local):
-            if not os.path.isdir(os.path.dirname(thumb_local)):
-                os.makedirs(os.path.dirname(thumb_local))
-            urllib.urlretrieve(thumb_url, thumb_local)
-        
-        return thumb_local
-        
-    def download_thumb(self, entity_type, entity_id, download_to):
-        thumb_url = self._get_thumb_url(entity_type, entity_id)
-        downloaded_name = entity_type + "_" + str(entity_id) + "_" + "/".join(thumb_url.split("/")[4:]).replace("/", "_")
-        downloaded_path = os.path.join(download_to, downloaded_name)
-        urllib.urlretrieve(thumb_url, downloaded_path)
-        return downloaded_path
-  
+    
     def schema_read(self):
         resp = self._api3.schema_read()
         return resp["results"]
@@ -302,7 +250,7 @@ class Shotgun:
         resp = self._api3.schema_entity_read()
         return resp["results"]
 
-    def find(self, entity_type, filters, fields=None, order=None, filter_operator=None, limit=0, retired_only=False, local_images=False):
+    def find(self, entity_type, filters, fields=None, order=None, filter_operator=None, limit=0, retired_only=False):
         """
         Find entities of entity_type matching the given filters.
         
@@ -318,10 +266,7 @@ class Shotgun:
             fields = ['id']
         if order == None: 
             order = []
-                
-        if local_images and not self.image_cache:
-            raise ShotgunError("Local images have been requested, but no local image cache has been specified")
-
+        
         if type(filters) == type([]):
             new_filters = {}
             if not filter_operator or filter_operator == "all":
@@ -342,33 +287,9 @@ class Shotgun:
         else:
             return_only = 'active'
         
-        returnFields = []
-        renameFields = {}
-        if type(fields) == dict:
-            fields = [fields]
-        for field in fields:
-            if type(field) == dict:
-                for rename in field:
-                    returnFields.append(field[rename])
-                    renameFields[field[rename]] = rename
-            else:
-                returnFields.append(field)
-        
-        # To get images, we actually need to request the appropriate entity's IDs
-        # So get a remapping to determine which IDs need to subsequently be converted
-        # into image results.
-        # In the imageFields dict, the keys are what the resulting images shout be called,
-        # and the values are what the requested IDs are.
-        imageFields = {}
-        for field in returnFields:
-            if field == "image":
-                imageFields["image"] = "id"
-            elif field.split(".")[-1] == "image":
-        		imageFields[field] = ".".join(field.split(".")[:-1] + ["id"])
-        
         req = {
             "type": entity_type,
-            "return_fields": returnFields + imageFields.values(),
+            "return_fields": fields,
             "filters": filters,
             "return_only" : return_only,
             "paging": {"entities_per_page": self.records_per_page, "current_page": 1}
@@ -404,53 +325,19 @@ class Shotgun:
             else:
                 done = True
         
-        
-        for field in imageFields:
-            # If the requested image is coming from the actual entity that we've requested, then
-            # just use the master entity_type and resulting record ID to get it.
-            if field == "image":
-                for i,v in enumerate(records):
-                    if records[i][field]:
-                        if local_images:
-                            records[i][field] = self.get_local_thumb(entity_type,records[i]['id'])
-                        else:
-                            records[i][field] = self._get_thumb_url(entity_type,records[i]['id'])
-            # Otherwise, get the requested entity type from the requested field path (where the path
-            # is of format "<anything>.<entity_type>.image")
-            else:
-                for i,v in enumerate(records):
-                    if records[i][field]:
-                        image_entity_type = field.split(".")[-2]
-                        if local_images:
-                            records[i][field] = self.get_local_thumb(image_entity_type,records[i][imageFields[field]])
-                        else:
-                            records[i][field] = self._get_thumb_url(image_entity_type,records[i][imageFields[field]])
-                        
-                        # If the ID that we've had to request wasn't explicitely included, remove it
-                        # from the results.
-                        if imageFields[field] not in returnFields:
-                            del records[i][imageFields[field]]
-
-        if renameFields:
-            newRecords = []
-            for record in records:
-                newRecord = {}
-                for field in record:
-                    if field in renameFields:
-                        newRecord[renameFields[field]] = record[field]
-                    else:
-                        newRecord[field] = record[field]
-                newRecords.append(newRecord)
-            
-            records = newRecords
+        # 'image' only returns id by default. add links to the thumbnail images
+        if 'image' in set(fields):
+            for i,v in enumerate(records):
+                if records[i]['image']:
+                    records[i]['image'] = self._get_thumb_url(entity_type,records[i]['id'])
         
         return records
     
-    def find_one(self, entity_type, filters, fields=None, order=None, filter_operator=None, retired_only=False, local_images=False):
+    def find_one(self, entity_type, filters, fields=None, order=None, filter_operator=None, retired_only=False):
         """
         Same as find, but only returns 1 result as a dict 
         """
-        result = self.find(entity_type, filters, fields, order, filter_operator, 1, retired_only, local_images)
+        result = self.find(entity_type, filters, fields, order, filter_operator, 1, retired_only)
         if len(result) > 0:
             return result[0]
         else:
@@ -466,7 +353,6 @@ class Shotgun:
             raise ShotgunError("batch() expects a list.  Instead was sent a %s"%type(requests))
         
         reqs = []
-        imageUploads = []
         
         for r in requests:
             self._required_keys("Batched request",['request_type','entity_type'],r)
@@ -484,15 +370,7 @@ class Shotgun:
                     nr["return_fields"] = r
                 
                 for f,v in r["data"].items():
-                    if f == "image":
-                        # We will be using the passed in data to determine which of the created entities
-                        # will have the image associated with it. We remove the 'image' field from the
-                        # data for comparison because this won't be in the initially created entity.
-                        entity_data = copy.deepcopy(r['data'])
-                        del entity_data['image']
-                        imageUploads.append({'request_type': "create", 'entity_type': r['entity_type'], 'entity_data': entity_data, 'image': v})
-                    else:
-                        nr["fields"].append( { "field_name": f, "value": v } )
+                    nr["fields"].append( { "field_name": f, "value": v } )
                 
                 reqs.append(nr)
             elif r["request_type"] == "update":
@@ -506,10 +384,7 @@ class Shotgun:
                 }
                 
                 for f,v in r["data"].items():
-                    if f == "image":
-                        imageUploads.append({'request_type': "update", 'entity_type': r['entity_type'], 'entity_id': r['entity_id'], 'image': v})
-                    else:
-                        nr["fields"].append( { "field_name": f, "value": v } )
+                    nr["fields"].append( { "field_name": f, "value": v } )
                 
                 reqs.append(nr)
             elif r["request_type"] == "delete":
@@ -526,55 +401,7 @@ class Shotgun:
                 raise ShotgunError("Invalid request_type for batch")
         
         resp = self._api3.batch(reqs)
-        
-        # For each image marked to be uploaded, search through the returned entities to determine
-        # which one the images should be linked to.
-        for image in imageUploads:
-            if image['request_type'] == "update":
-                for r in resp['results']:
-                    if image['entity_id'] == r['id']:
-                        self.upload_thumbnail(image['entity_type'], image['entity_id'], image['image'])
-                        r['image'] = image['image']
-                        break
-                        
-            elif image['request_type'] == "create":
-                for r in resp['results']:
-                    # If there is already an image associated with this result, then skip it. This
-                    # enables multiple otherwise identical records to be created with different
-                    # images. If we didn't do this, all otherwise identical new records would be
-                    # assigned the same image as the first one.
-                    if "image" in r:
-                        continue
-                    # isSubSet() will determine if the image associated with the image is a sub set
-                    # of the data returned by the result. We aren't checking if it's actually
-                    # identical, as the returned result will usually have extra fields added that
-                    # weren't specified in the initial call for creation.
-                    if self.isSubSet(image['entity_data'], r):
-                        self.upload_thumbnail(image['entity_type'], r['id'], image['image'])
-                        r['image'] = image['image']
-                        break
-        
         return resp["results"]
-    
-    # Checks if every element in 'sub' is also in 'master'.
-    # For dict, list, tuple, set elements, checks sub elements
-    def isSubSet(self, sub, master):
-        for k in sub:
-            if k not in master:
-                return False
-            if type(sub[k]) != type(master[k]):
-                return False
-            if type(sub[k]) == dict:
-                if not self.isSubSet(sub[k], master[k]):
-                    return False
-            elif type(sub[k]) in (list, tuple, set):
-                if not set(sub[k]).issubset(set(master[k])):
-                    return False
-            else:
-                if sub[k] != master[k]:
-                    return False
-        return True
-            
         
     def create(self, entity_type, data, return_fields=None):
         """
@@ -591,20 +418,10 @@ class Shotgun:
             "fields":[],
             "return_fields":return_fields
         }
-        
-        uploadImage = False
-        if 'image' in data:
-            uploadImage = data['image']
-            del data['image']
-        
         for f,v in data.items():
             args["fields"].append( {"field_name":f,"value":v} )
         
         resp = self._api3.create(args)
-        
-        if uploadImage:
-            self.upload_thumbnail(entity_type, resp['results']['id'], uploadImage)
-        
         return resp["results"]
         
     def update(self, entity_type, entity_id, data):
@@ -614,29 +431,11 @@ class Shotgun:
         'data' is a dict of key=>value pairs of fieldname and value
         to set the field to. 
         """
-        
-        if type(entity_id) == dict and "id" in entity_id:
-            entity_id = entity_id['id']
-        
         args = {"type":entity_type,"id":entity_id,"fields":[]}
-        uploadImage = False
-        if 'image' in data:
-            # If we don't make a copy of 'data', it will have been changed on return
-            data = copy.deepcopy(data)
-            uploadImage = data['image']
-            del data['image']
-        
-        if data:
-            for f,v in data.items():
-                args["fields"].append( {"field_name":f,"value":v} )
+        for f,v in data.items():
+            args["fields"].append( {"field_name":f,"value":v} )
             
-            resp = self._api3.update(args)
-        else:
-            resp = {'results': {'id': entity_id, 'type': entity_type}}
-
-        if uploadImage:
-            self.upload_thumbnail(entity_type, entity_id, uploadImage)
-                    
+        resp = self._api3.update(args)
         return resp["results"]
 
     def delete(self, entity_type, entity_id):
