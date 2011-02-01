@@ -1,21 +1,21 @@
 #!/usr/bin/env python
 # ---------------------------------------------------------------------------------------------
 # Copyright (c) 2009-2010, Shotgun Software Inc
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
-# 
+#
 #  - Redistributions of source code must retain the above copyright notice, this
-#    list of conditions and the following disclaimer. 
-#    
+#    list of conditions and the following disclaimer.
+#
 #  - Redistributions in binary form must reproduce the above copyright notice,
 #    this list of conditions and the following disclaimer in the documentation
 #    and/or other materials provided with the distribution.
-#    
+#
 #  - Neither the name of the Shotgun Software Inc nor the names of its
 #    contributors may be used to endorse or promote products derived from this
 #    software without specific prior written permission.
-# 
+#
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 # AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 # IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -32,7 +32,7 @@
 #   https://support.shotgunsoftware.com/forums/48807-developer-api-info
 # ---------------------------------------------------------------------------------------------
 
-__version__ = "3.0.1"
+__version__ = "3.0.3nv1"
 
 # ---------------------------------------------------------------------------------------------
 # SUMMARY
@@ -58,6 +58,33 @@ Python Shotgun API library.
 # CHANGELOG
 # ---------------------------------------------------------------------------------------------
 """
++v3.0.3nv1 - 2010 Nov 11
+  + Merged v3.0.3 and v3.0.2nv1
+
++v3.0.3 - 2010 Nov 07
+  + add support for local files. Injects convenience info into returned hash for local file links
+
++v3.0.2nv1 - 2010 May 10
+  + Merged v3.0.2 and v3.0.1nv3
+
++v3.0.2 - 2010 May 10
+  + add revive() method to revive deleted entities
+
+v3.0.1nv3 - 2010 July 25
+  + batch() : Now supports 'update' and 'create' requests with images that will be uploaded.
+
+v3.0.1nv2 - 2010 July 25
+  + find() : Fixed a bug where requesting image from linked entities would still return the main entity's
+             image.
+
+v3.0.1nv1 - 2010 July 24
+  + find() : Added the ability to request for return fields to be renamed before returning them
+             Added the ability to specify a local image cache folder and request for images to be downloaded
+             Added the ability to get images from linked entities, not just the current entity
+  + create() and update() : Added the ability to path a local image path in as 'image' and have it uploaded automatically
+  + update() : Can now also pass an entity dict instead of entity_id and it will use the 'id' key.
+  * Warning: none of the create() and update() changes will currently work in Batch mode.
+
 v3.0.1 - 2010 May 10
   + find(): default sorting to ascending, if not set (instead of requiring ascending/descending)
   + upload() and upload_thumbnail(): pass auth info through
@@ -132,12 +159,14 @@ import cStringIO
 import mimetools
 import mimetypes
 import os
+import platform
 import re
 import stat
 import sys
 import time
 import urllib
 import urllib2
+import copy
 from urlparse import urlparse
 
 # ---------------------------------------------------------------------------------------------
@@ -150,8 +179,9 @@ class Shotgun:
     # when getting lots of results back.  doesn't affect the interface of the api at all (you always get the full set
     # of results back as one array) but just how the client class communicates with the server.
     records_per_page = 500
+    schema_expire_mins = 60
 
-    def __init__(self, base_url, script_name, api_key, convert_datetimes_to_utc=True, http_proxy=None):
+    def __init__(self, base_url, script_name, api_key, convert_datetimes_to_utc=True, http_proxy=None, image_cache=None):
         """
         Initialize Shotgun.
         """
@@ -167,6 +197,12 @@ class Shotgun:
         self.convert_datetimes_to_utc = convert_datetimes_to_utc
         self.sid = None # only load this if needed
         self.http_proxy = http_proxy
+
+        if image_cache and not os.path.isdir(image_cache):
+            raise ShotgunError("Specified image cache location does not exist")
+
+        self.image_cache = image_cache
+        
         
         server_options = {
             'server_url': self.api_url,
@@ -178,10 +214,66 @@ class Shotgun:
         
         self._api3 = ShotgunCRUD(server_options)
         
+        self.local_path_string = None
+        self.platform = self._determine_platform()
+        if self.platform:
+            self.local_path_string = "local_path_%s" % (self.platform)
+    
+    def set_image_cache(self, cache_location, create_location = True):
+        if not os.path.isdir(cache_location):
+            if create_location:
+                os.makedirs(cache_location)
+
+        if not os.path.isdir(cache_location):
+            raise ShotgunError("Specified image cache location does not exist")
+        
+        self.image_cache = cache_location
+
+    def _determine_platform(self):
+        s = platform.system().lower()
+        if s in ['windows','linux','darwin']:
+            if s == 'darwin':
+                return 'mac'
+            else:
+                return s
+        return None
+    
+    def _inject_field_values(self, records):
+        """
+        Inject additional information into server results for convenience before returning
+        records back to the client. Currently this includes:
+        - 'image' value is rewritten to provide url to thumbnail image
+        - any local file link fields
+            'local_file' key is set to match the current platform's path
+            'url' key is set to match the current platform's url
+        """
+        if len(records) == 0:
+            return records
+        
+        for i,r in enumerate(records):
+            # skip results that aren't entity dictionaries
+            if type(r) is not dict:
+                continue
+            
+            # iterate over each item and check each field for possible injection
+            for k, v in r.items():
+                # check for thumbnail
+                if k == 'image' and v:
+                    records[i]['image'] = self._get_thumb_url(r['type'], r['id'])
+                
+                if type(v) == dict and 'link_type' in v and v['link_type'] == 'local' \
+                    and self.platform and self.local_path_string in r[k]:
+                    # from pprint import pprint
+                    # pprint(r)
+                    records[i][k]['local_path'] = r[k][self.local_path_string]
+                    records[i][k]['url'] = "file://%s" % (r[k]['local_path'])
+        
+        return records
+    
     def _get_thumb_url(self, entity_type, entity_id):
         """
-        Returns the URL for the thumbnail of an entity given the 
-        entity type and the entity id 
+        Returns the URL for the thumbnail of an entity given the
+        entity type and the entity id
         """
         url = self.base_url + "/upload/get_thumbnail_url?entity_type=%s&entity_id=%d"%(entity_type,entity_id)
         for i in range(3):
@@ -189,17 +281,37 @@ class Shotgun:
             response_code = f.readline().strip()
             # something else happened. try again. found occasional connection errors still spit out html but not
             # the correct response codes. usually trying again will right the ship. if not, we catch for it later.
-            if response_code not in ('0','1'): 
-                continue    
-            elif response_code == '1': 
+            if response_code not in ('0','1'):
+                continue
+            elif response_code == '1':
                 path = f.readline().strip()
                 if path:
                     return self.base_url + path
             elif response_code == '0':
-                break                        
+                break
         # if it's an error, message is printed on second line
         raise ValueError, "%s:%s " % (entity_type,entity_id)+f.read().strip()
-    
+
+    def get_local_thumb(self, entity_type, entity_id):
+        if not self.image_cache:
+            raise ShotgunError("No image cache location specified")
+            
+        thumb_url = self._get_thumb_url(entity_type, entity_id)
+        thumb_local = os.path.join(self.image_cache, *thumb_url.split("/")[4:])
+        if not os.path.isfile(thumb_local):
+            if not os.path.isdir(os.path.dirname(thumb_local)):
+                os.makedirs(os.path.dirname(thumb_local))
+            urllib.urlretrieve(thumb_url, thumb_local)
+        
+        return thumb_local
+        
+    def download_thumb(self, entity_type, entity_id, download_to):
+        thumb_url = self._get_thumb_url(entity_type, entity_id)
+        downloaded_name = entity_type + "_" + str(entity_id) + "_" + "/".join(thumb_url.split("/")[4:]).replace("/", "_")
+        downloaded_path = os.path.join(download_to, downloaded_name)
+        urllib.urlretrieve(thumb_url, downloaded_path)
+        return downloaded_path
+  
     def schema_read(self):
         resp = self._api3.schema_read()
         return resp["results"]
@@ -214,7 +326,7 @@ class Shotgun:
         return resp["results"]
     
     def schema_field_create(self, entity_type, data_type, display_name, properties=None):
-        if properties == None: 
+        if properties == None:
             properties = {}
         
         args = {
@@ -250,23 +362,26 @@ class Shotgun:
         resp = self._api3.schema_entity_read()
         return resp["results"]
 
-    def find(self, entity_type, filters, fields=None, order=None, filter_operator=None, limit=0, retired_only=False):
+    def find(self, entity_type, filters, fields=None, order=None, filter_operator=None, limit=0, retired_only=False, local_images=False):
         """
         Find entities of entity_type matching the given filters.
         
-        The columns returned for each entity match the 'fields' 
+        The columns returned for each entity match the 'fields'
         parameter provided, or just the id if nothing is specified.
         
         Limit constrains the total results to its value.
         
         Returns an array of dict entities sorted by the optional
-        'order' parameter. 
+        'order' parameter.
         """
-        if fields == None: 
+        if fields == None:
             fields = ['id']
-        if order == None: 
+        if order == None:
             order = []
-        
+                
+        if local_images and not self.image_cache:
+            raise ShotgunError("Local images have been requested, but no local image cache has been specified")
+
         if type(filters) == type([]):
             new_filters = {}
             if not filter_operator or filter_operator == "all":
@@ -287,9 +402,33 @@ class Shotgun:
         else:
             return_only = 'active'
         
+        returnFields = []
+        renameFields = {}
+        if type(fields) == dict:
+            fields = [fields]
+        for field in fields:
+            if type(field) == dict:
+                for rename in field:
+                    returnFields.append(field[rename])
+                    renameFields[field[rename]] = rename
+            else:
+                returnFields.append(field)
+        
+        # To get images, we actually need to request the appropriate entity's IDs
+        # So get a remapping to determine which IDs need to subsequently be converted
+        # into image results.
+        # In the imageFields dict, the keys are what the resulting images shout be called,
+        # and the values are what the requested IDs are.
+        imageFields = {}
+        for field in returnFields:
+            if field == "image":
+                imageFields["image"] = "id"
+            elif field.split(".")[-1] == "image":
+        		imageFields[field] = ".".join(field.split(".")[:-1] + ["id"])
+        
         req = {
             "type": entity_type,
-            "return_fields": fields,
+            "return_fields": returnFields + imageFields.values(),
             "filters": filters,
             "return_only" : return_only,
             "paging": {"entities_per_page": self.records_per_page, "current_page": 1}
@@ -324,20 +463,56 @@ class Shotgun:
                     req['paging']['current_page'] += 1
             else:
                 done = True
+
+        records = self._inject_field_values(records)
+
         
-        # 'image' only returns id by default. add links to the thumbnail images
-        if 'image' in set(fields):
-            for i,v in enumerate(records):
-                if records[i]['image']:
-                    records[i]['image'] = self._get_thumb_url(entity_type,records[i]['id'])
+        for field in imageFields:
+            # If the requested image is coming from the actual entity that we've requested, then
+            # just use the master entity_type and resulting record ID to get it.
+            if field == "image":
+                for i,v in enumerate(records):
+                    if records[i][field]:
+                        if local_images:
+                            records[i][field] = self.get_local_thumb(entity_type,records[i]['id'])
+                        else:
+                            records[i][field] = self._get_thumb_url(entity_type,records[i]['id'])
+            # Otherwise, get the requested entity type from the requested field path (where the path
+            # is of format "<anything>.<entity_type>.image")
+            else:
+                for i,v in enumerate(records):
+                    if records[i][field]:
+                        image_entity_type = field.split(".")[-2]
+                        if local_images:
+                            records[i][field] = self.get_local_thumb(image_entity_type,records[i][imageFields[field]])
+                        else:
+                            records[i][field] = self._get_thumb_url(image_entity_type,records[i][imageFields[field]])
+                        
+                        # If the ID that we've had to request wasn't explicitely included, remove it
+                        # from the results.
+                        if imageFields[field] not in returnFields:
+                            del records[i][imageFields[field]]
+
+        if renameFields:
+            newRecords = []
+            for record in records:
+                newRecord = {}
+                for field in record:
+                    if field in renameFields:
+                        newRecord[renameFields[field]] = record[field]
+                    else:
+                        newRecord[field] = record[field]
+                newRecords.append(newRecord)
+            
+            records = newRecords
         
         return records
     
-    def find_one(self, entity_type, filters, fields=None, order=None, filter_operator=None, retired_only=False):
+    def find_one(self, entity_type, filters, fields=None, order=None, filter_operator=None, retired_only=False, local_images=False):
         """
-        Same as find, but only returns 1 result as a dict 
+        Same as find, but only returns 1 result as a dict
         """
-        result = self.find(entity_type, filters, fields, order, filter_operator, 1, retired_only)
+        result = self.find(entity_type, filters, fields, order, filter_operator, 1, retired_only, local_images)
         if len(result) > 0:
             return result[0]
         else:
@@ -353,13 +528,14 @@ class Shotgun:
             raise ShotgunError("batch() expects a list.  Instead was sent a %s"%type(requests))
         
         reqs = []
+        imageUploads = []
         
         for r in requests:
             self._required_keys("Batched request",['request_type','entity_type'],r)
             
             if r["request_type"] == "create":
                 self._required_keys("Batched create request",['data'],r)
-                    
+                
                 nr = {
                     "request_type": "create",
                     "type": r["entity_type"],
@@ -370,12 +546,20 @@ class Shotgun:
                     nr["return_fields"] = r
                 
                 for f,v in r["data"].items():
-                    nr["fields"].append( { "field_name": f, "value": v } )
+                    if f == "image":
+                        # We will be using the passed in data to determine which of the created entities
+                        # will have the image associated with it. We remove the 'image' field from the
+                        # data for comparison because this won't be in the initially created entity.
+                        entity_data = copy.deepcopy(r['data'])
+                        del entity_data['image']
+                        imageUploads.append({'request_type': "create", 'entity_type': r['entity_type'], 'entity_data': entity_data, 'image': v})
+                    else:
+                        nr["fields"].append( { "field_name": f, "value": v } )
                 
                 reqs.append(nr)
             elif r["request_type"] == "update":
                 self._required_keys("Batched create request",['entity_id','data'],r)
-                    
+                
                 nr = {
                     "request_type": "update",
                     "type": r["entity_type"],
@@ -384,12 +568,15 @@ class Shotgun:
                 }
                 
                 for f,v in r["data"].items():
-                    nr["fields"].append( { "field_name": f, "value": v } )
+                    if f == "image":
+                        imageUploads.append({'request_type': "update", 'entity_type': r['entity_type'], 'entity_id': r['entity_id'], 'image': v})
+                    else:
+                        nr["fields"].append( { "field_name": f, "value": v } )
                 
                 reqs.append(nr)
             elif r["request_type"] == "delete":
                 self._required_keys("Batched delete request",['entity_id'],r)
-                    
+                
                 nr = {
                     "request_type": "delete",
                     "type": r["entity_type"],
@@ -401,16 +588,65 @@ class Shotgun:
                 raise ShotgunError("Invalid request_type for batch")
         
         resp = self._api3.batch(reqs)
-        return resp["results"]
+        records = self._inject_field_values(resp["results"])
+        
+        # For each image marked to be uploaded, search through the returned entities to determine
+        # which one the images should be linked to.
+        for image in imageUploads:
+            if image['request_type'] == "update":
+                for r in records:
+                    if image['entity_id'] == r['id']:
+                        self.upload_thumbnail(image['entity_type'], image['entity_id'], image['image'])
+                        r['image'] = image['image']
+                        break
+                        
+            elif image['request_type'] == "create":
+                for r in records:
+                    # If there is already an image associated with this result, then skip it. This
+                    # enables multiple otherwise identical records to be created with different
+                    # images. If we didn't do this, all otherwise identical new records would be
+                    # assigned the same image as the first one.
+                    if "image" in r:
+                        continue
+                    # isSubSet() will determine if the image associated with the image is a sub set
+                    # of the data returned by the result. We aren't checking if it's actually
+                    # identical, as the returned result will usually have extra fields added that
+                    # weren't specified in the initial call for creation.
+                    if self.isSubSet(image['entity_data'], r):
+                        self.upload_thumbnail(image['entity_type'], r['id'], image['image'])
+                        r['image'] = image['image']
+                        break
+        
+        return records
+    
+    # Checks if every element in 'sub' is also in 'master'.
+    # For dict, list, tuple, set elements, checks sub elements
+    def isSubSet(self, sub, master):
+        for k in sub:
+            if k not in master:
+                return False
+            if type(sub[k]) != type(master[k]):
+                return False
+            if type(sub[k]) == dict:
+                if not self.isSubSet(sub[k], master[k]):
+                    return False
+            elif type(sub[k]) in (list, tuple, set):
+                if not set(sub[k]).issubset(set(master[k])):
+                    return False
+            else:
+                if sub[k] != master[k]:
+                    return False
+        return True
+            
         
     def create(self, entity_type, data, return_fields=None):
         """
         Create a new entity of entity_type type.
         
         'data' is a dict of key=>value pairs of fieldname and value
-        to set the field to. 
+        to set the field to.
         """
-        if return_fields == None: 
+        if return_fields == None:
             return_fields = ['id']
         
         args = {
@@ -418,25 +654,57 @@ class Shotgun:
             "fields":[],
             "return_fields":return_fields
         }
+        
+        uploadImage = False
+        if 'image' in data:
+            uploadImage = data['image']
+            del data['image']
+        
         for f,v in data.items():
             args["fields"].append( {"field_name":f,"value":v} )
         
         resp = self._api3.create(args)
-        return resp["results"]
+        
+        if uploadImage:
+            self.upload_thumbnail(entity_type, resp['results']['id'], uploadImage)
+        
+        records = self._inject_field_values([resp["results"]])
+
+        return records
         
     def update(self, entity_type, entity_id, data):
         """
         Update an entity given the entity_type, and entity_id
         
         'data' is a dict of key=>value pairs of fieldname and value
-        to set the field to. 
+        to set the field to.
         """
+        
+        if type(entity_id) == dict and "id" in entity_id:
+            entity_id = entity_id['id']
+        
         args = {"type":entity_type,"id":entity_id,"fields":[]}
-        for f,v in data.items():
-            args["fields"].append( {"field_name":f,"value":v} )
+        uploadImage = False
+        if 'image' in data:
+            # If we don't make a copy of 'data', it will have been changed on return
+            data = copy.deepcopy(data)
+            uploadImage = data['image']
+            del data['image']
+        
+        if data:
+            for f,v in data.items():
+                args["fields"].append( {"field_name":f,"value":v} )
             
-        resp = self._api3.update(args)
-        return resp["results"]
+            resp = self._api3.update(args)
+        else:
+            resp = {'results': {'id': entity_id, 'type': entity_type}}
+
+        if uploadImage:
+            self.upload_thumbnail(entity_type, entity_id, uploadImage)
+                    
+        records = self._inject_field_values([resp["results"]])
+
+        return records
 
     def delete(self, entity_type, entity_id):
         """
@@ -444,7 +712,14 @@ class Shotgun:
         """
         resp = self._api3.delete( {"type":entity_type, "id":entity_id} )
         return resp["results"]
-
+    
+    def revive(self, entity_type, entity_id):
+        """
+        Revive an entity given the entity_type, and entity_id
+        """
+        resp = self._api3.revive( {"type":entity_type, "id":entity_id} )
+        return resp["results"]
+    
     def upload(self, entity_type, entity_id, path, field_name=None, display_name=None, tag_list=None):
         """
         Upload a file as an attachment/thumbnail to the entity_type and entity_id
@@ -462,7 +737,7 @@ class Shotgun:
         params["entity_type"] = entity_type
         params["entity_id"] = entity_id
         
-        # send auth, so server knows which 
+        # send auth, so server knows which
         # script uploaded the file
         params["script_name"] = self.script_name
         params["script_key"] = self.api_key
@@ -483,7 +758,7 @@ class Shotgun:
             params["display_name"] = display_name
             params["tag_list"] = tag_list
             params["file"] = open(path, "rb")
-
+        
         # Create opener with extended form post support
         opener = urllib2.build_opener(FormPostHandler)
         
@@ -501,19 +776,19 @@ class Shotgun:
         
         # we changed the result string in the middle of 1.8 to return the id
         # remove once everyone is > 1.8.3
-        r = str(result).split(":") 
+        r = str(result).split(":")
         id = 0
         if len(r) > 1:
             id = int(str(result).split(":")[1].split("\n")[0])
         return id
-        
+    
     def upload_thumbnail(self, entity_type, entity_id, path, **kwargs):
         """
         Convenience function for thumbnail uploads.
         """
         result = self.upload(entity_type, entity_id, path, field_name="thumb_image", **kwargs)
         return result
-        
+    
     def download_attachment(self, entity_id):
         """
         Gets session authentication and returns binary content of Attachment data
@@ -526,12 +801,12 @@ class Shotgun:
         cookie_handler = urllib2.HTTPCookieProcessor(cj)
         urllib2.install_opener(urllib2.build_opener(cookie_handler))
         url = '%s/file_serve/attachment/%s' % (self.base_url, entity_id)
-
+        
         try:
             request = urllib2.Request(url)
             request.add_header('User-agent','Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10.5; en-US; rv:1.9.0.7) Gecko/2009021906 Firefox/3.0.7')
-            attachment = urllib2.urlopen(request).read() 
-
+            attachment = urllib2.urlopen(request).read()
+        
         except IOError, e:
             err = "Failed to open %s" % url
             if hasattr(e, 'code'):
@@ -541,8 +816,10 @@ class Shotgun:
                 err += "\nThis usually means the server doesn't exist, is down, or we don't have an internet connection."
             raise ShotgunError(err)
         else:
-            if attachment.lstrip().startswith('<!DOCTYPE HTML'):
-                raise ShotgunError("The server generated an error trying to download the Attachment. \nURL: %s\nServer Response: %s" % (url, attachment))
+            if attachment.lstrip().startswith('<!DOCTYPE '):
+                error_string = "\n%s\nThe server generated an error trying to download the Attachment. \nURL: %s\n" \
+                    "Either the file doesn't exist, or it is a local file which isn't downloadable.\n%s\n" % ("="*30, url, "="*30)
+                raise ShotgunError(error_string)
         return attachment
     
     def _get_session_token(self):
@@ -556,7 +833,7 @@ class Shotgun:
             conn = ServerProxy(api2_url)
             self.sid = conn.getSessionToken([self.script_name, self.api_key])['session_id']
         return self.sid
-
+    
     # Deprecated methods from old wrapper
     def schema(self, entity_type):
         raise ShotgunError("Deprecated: use schema_field_read('type':'%s') instead" % entity_type)
@@ -610,7 +887,7 @@ class FormPostHandler(urllib2.BaseHandler):
     Handler for multipart form data
     """
     handler_order = urllib2.HTTPHandler.handler_order - 10 # needs to run first
-
+    
     def http_request(self, request):
         data = request.get_data()
         if data is not None and not isinstance(data, basestring):
@@ -629,7 +906,7 @@ class FormPostHandler(urllib2.BaseHandler):
                 request.add_unredirected_header('Content-Type', content_type)
             request.add_data(data)
         return request
-
+    
     def encode(self, params, files, boundary=None, buffer=None):
         if boundary is None:
             boundary = mimetools.choose_boundary()
@@ -652,7 +929,7 @@ class FormPostHandler(urllib2.BaseHandler):
         buffer.write('--%s--\r\n\r\n' % boundary)
         buffer = buffer.getvalue()
         return boundary, buffer
-
+    
     def https_request(self, request):
         return self.http_request(request)
 
@@ -660,9 +937,9 @@ class FormPostHandler(urllib2.BaseHandler):
 
 
 # ---------------------------------------------------------------------------------------------
-#  SG_TIMEZONE module 
-#  this is rolled into the this shotgun api file to avoid having to require current users of 
-#  api2 to install new modules and modify PYTHONPATH info. 
+#  SG_TIMEZONE module
+#  this is rolled into the this shotgun api file to avoid having to require current users of
+#  api2 to install new modules and modify PYTHONPATH info.
 # ---------------------------------------------------------------------------------------------
 from datetime import tzinfo, timedelta, datetime
 import time as _time
@@ -676,39 +953,39 @@ else:
 DSTDIFF = DSTOFFSET - STDOFFSET
 
 class SgTimezone:
-            
+    
     def __init__(self):
         self.utc = self.UTC()
         self.local = self.LocalTimezone()
-        
+    
     class UTC(tzinfo):
-
+        
         def utcoffset(self, dt):
             return ZERO
-
+        
         def tzname(self, dt):
             return "UTC"
-
+        
         def dst(self, dt):
             return ZERO
-
+    
     class LocalTimezone(tzinfo):
-
+        
         def utcoffset(self, dt):
             if self._isdst(dt):
                 return DSTOFFSET
             else:
                 return STDOFFSET
-
+        
         def dst(self, dt):
             if self._isdst(dt):
                 return DSTDIFF
             else:
                 return ZERO
-
+        
         def tzname(self, dt):
             return _time.tzname[self._isdst(dt)]
-
+        
         def _isdst(self, dt):
             tt = (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.weekday(), 0, -1)
             stamp = _time.mktime(tt)
@@ -820,23 +1097,23 @@ The marshalling and response parser code can also be used to
 implement XML-RPC servers.
 
 Exported exceptions:
-
+  
   Error          Base class for client errors
   ProtocolError  Indicates an HTTP protocol error
   ResponseError  Indicates a broken response package
   Fault          Indicates an XML-RPC fault package
 
 Exported classes:
-
+  
   ServerProxy    Represents a logical connection to an XML-RPC server
-
+  
   MultiCall      Executor of boxcared xmlrpc requests
   Boolean        boolean wrapper to generate a "boolean" XML-RPC value
   DateTime       dateTime wrapper for an ISO 8601 string or time tuple or
                  localtime integer value to generate a "dateTime.iso8601"
                  XML-RPC value
   Binary         binary data wrapper
-
+  
   SlowParser     Slow but safe standard parser (based on xmllib)
   Marshaller     Generate an XML-RPC params chunk from a Python data structure
   Unmarshaller   Unmarshal an XML-RPC response from incoming XML event message
@@ -844,12 +1121,12 @@ Exported classes:
   SafeTransport  Handles an HTTPS transaction to an XML-RPC server
 
 Exported constants:
-
+  
   True
   False
 
 Exported functions:
-
+  
   boolean        Convert any Python value to an XML-RPC boolean
   getparser      Create instance of the fastest available parser & attach
                  to an unmarshalling object
@@ -1016,35 +1293,35 @@ if _bool_is_builtin:
 else:
     class Boolean:
         """Boolean-value wrapper.
-
+        
         Use True or False to generate a "boolean" XML-RPC value.
         """
-
+        
         def __init__(self, value = 0):
             self.value = operator.truth(value)
-
+        
         def encode(self, out):
             out.write("<value><boolean>%d</boolean></value>\n" % self.value)
-
+        
         def __cmp__(self, other):
             if isinstance(other, Boolean):
                 other = other.value
             return cmp(self.value, other)
-
+        
         def __repr__(self):
             if self.value:
                 return "<Boolean True at %x>" % id(self)
             else:
                 return "<Boolean False at %x>" % id(self)
-
+        
         def __int__(self):
             return self.value
-
+        
         def __nonzero__(self):
             return self.value
-
+    
     True, False = Boolean(1), Boolean(0)
-
+    
     ##
     # Map true or false value to XML-RPC boolean values.
     #
@@ -1055,7 +1332,7 @@ else:
     # @see Boolean
     # @see True
     # @see False
-
+    
     def boolean(value, _truefalse=(False, True)):
         """Convert any Python value to XML-RPC 'boolean'."""
         return _truefalse[operator.truth(value)]
@@ -1078,7 +1355,7 @@ class DateTime:
     localtime integer value to generate 'dateTime.iso8601' XML-RPC
     value.
     """
-
+    
     def __init__(self, value=0):
         if not isinstance(value, StringType):
             if datetime and isinstance(value, datetime.datetime):
@@ -1097,27 +1374,27 @@ class DateTime:
                 value = time.localtime(value)
             value = time.strftime("%Y%m%dT%H:%M:%S", value)
         self.value = value
-
+    
     def __cmp__(self, other):
         if isinstance(other, DateTime):
             other = other.value
         return cmp(self.value, other)
-
+    
     ##
     # Get date/time value.
     #
     # @return Date/time value, as an ISO 8601 string.
-
+    
     def __str__(self):
         return self.value
-
+    
     def __repr__(self):
         return "<DateTime %s at %x>" % (repr(self.value), id(self))
-
+    
     def decode(self, data):
         data = str(data)
         self.value = string.strip(data)
-
+    
     def encode(self, out):
         out.write("<value><dateTime.iso8601>")
         out.write(self.value)
@@ -1147,26 +1424,26 @@ except ImportError:
 
 class Binary:
     """Wrapper for binary data."""
-
+    
     def __init__(self, data=None):
         self.data = data
-
+    
     ##
     # Get buffer contents.
     #
     # @return Buffer contents, as an 8-bit string.
-
+    
     def __str__(self):
         return self.data or ""
-
+    
     def __cmp__(self, other):
         if isinstance(other, Binary):
             other = other.data
         return cmp(self.data, other)
-
+    
     def decode(self, data):
         self.data = base64.decodestring(data)
-
+    
     def encode(self, out):
         out.write("<value><base64>\n")
         base64.encode(StringIO.StringIO(self.data), out)
@@ -1215,13 +1492,13 @@ except ImportError:
 else:
     class SgmlopParser:
         def __init__(self, target):
-
+            
             # setup callbacks
             self.finish_starttag = target.start
             self.finish_endtag = target.end
             self.handle_data = target.data
             self.handle_xml = target.xml
-
+            
             # activate parser
             self.parser = sgmlop.XMLParser()
             self.parser.register(self)
@@ -1230,18 +1507,18 @@ else:
                 "amp": "&", "gt": ">", "lt": "<",
                 "apos": "'", "quot": '"'
                 }
-
+        
         def close(self):
             try:
                 self.parser.close()
             finally:
                 self.parser = self.feed = None # nuke circular reference
-
+        
         def handle_proc(self, tag, attr):
             m = re.search("encoding\s*=\s*['\"]([^\"']+)[\"']", attr)
             if m:
                 self.handle_xml(m.group(1), 1)
-
+        
         def handle_entityref(self, entity):
             # <string> entity
             try:
@@ -1269,10 +1546,10 @@ else:
             if not parser.returns_unicode:
                 encoding = "utf-8"
             target.xml(encoding, None)
-
+        
         def feed(self, data):
             self._parser.Parse(data, 0)
-
+        
         def close(self):
             self._parser.Parse("", 1) # end of data
             del self._target, self._parser # get rid of circular references
@@ -1307,26 +1584,26 @@ class SlowParser:
 
 class Marshaller:
     """Generate an XML-RPC params chunk from a Python data structure.
-
+    
     Create a Marshaller instance for each set of parameters, and use
     the "dumps" method to convert your data (represented as a tuple)
     to an XML-RPC params chunk.  To write a fault response, pass a
     Fault instance instead.  You may prefer to use the "dumps" module
     function for this purpose.
     """
-
+    
     # by the way, if you don't understand what's going on in here,
     # that's perfectly ok.
-
+    
     def __init__(self, encoding=None, allow_none=1, convert_datetimes_to_utc=1):
         self.memo = {}
         self.data = None
         self.encoding = encoding
         self.allow_none = allow_none
         self.convert_datetimes_to_utc = convert_datetimes_to_utc
-
+    
     dispatch = {}
-
+    
     def dumps(self, values):
         out = []
         write = out.append
@@ -1353,7 +1630,7 @@ class Marshaller:
             write("</params>\n")
         result = string.join(out, "")
         return result
-
+    
     def __dump(self, value, write):
         try:
             f = self.dispatch[type(value)]
@@ -1361,7 +1638,7 @@ class Marshaller:
             raise TypeError, "cannot marshal %s objects" % type(value)
         else:
             f(self, value, write)
-
+    
     def dump_nil (self, value, write):
         if not self.allow_none:
             raise TypeError, "cannot marshal None unless allow_none is enabled"
